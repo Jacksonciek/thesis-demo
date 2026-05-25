@@ -102,7 +102,14 @@ class BloomForMTL_v2(BloomPreTrainedModel):
                 mask=attention_mask.bool(),
             )
         else:
-            token_preds_viterbi = token_emissions.argmax(-1).cpu().tolist()
+            # use_crf=False (Baseline 1): argmax over class dim (-1 = dim 2 of B×T×3)
+            # Only return predictions for non-padded positions (mask==1),
+            # matching CRF decode behavior (variable-length sublists).
+            raw_argmax = token_emissions.argmax(-1).cpu().tolist()  # (B, T)
+            token_preds_viterbi = [
+                [lbl for lbl, m in zip(seq, mask_seq) if m == 1]
+                for seq, mask_seq in zip(raw_argmax, attention_mask.cpu().tolist())
+            ]
 
         return {
             "sentence_logits": sentence_logits,

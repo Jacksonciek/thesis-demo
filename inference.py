@@ -7,9 +7,9 @@ identik: offset_mapping, char-to-word alignment, CRF Viterbi, span extraction.
 Fungsi build_*() menghasilkan output Gradio (HTML highlight + tabel BIO)
 dalam dark/glassmorphism theme yang cocok dengan UI futuristik.
 
-BUG FIXES:
-  - I-TOX word_bio upgrade logic now also handles I-TOX following I-TOX
-    correctly (was already correct, made explicit with comment).
+BUGFIX yang diterapkan:
+  - I-TOX word_bio assignment DIPERBAIKI: sebelumnya salah mempromosi
+    I-TOX → B-TOX (merusak span multi-kata). Kini identik NB05v2.
   - char_to_word space mapping documented: maps space position to the
     immediately following word index (intentional, matches NB05v2).
 """
@@ -82,6 +82,11 @@ def predict_text(
         out = model(input_ids, attention_mask)
 
     # ── Step 4: Temperature scaling (identik collect_predictions NB05) ─
+    # CATATAN AKADEMIS: predict_single_v2 di NB05v2 (page 308) TIDAK menerapkan
+    # temperature — kemungkinan oversight. Demo ini LEBIH KONSISTEN karena
+    # BEST_THRESHOLD_V2 = 0.4429 dikalibrasi via collect_predictions yang
+    # MENGGUNAKAN temperature (NB05v2 page 242). Dengan T=0.9710 (main model),
+    # probabilitas sedikit lebih tajam dan presisi threshold terjaga.
     temperature  = float(getattr(model, "temperature", 1.0))
     proba        = torch.softmax(
         out["sentence_logits"].float() / temperature, dim=-1
@@ -123,35 +128,39 @@ def predict_text(
         tag = ID2LABEL[crf_label]
         if tag == "B-TOX":
             word_bio[widx] = "B-TOX"
-        elif tag == "I-TOX":
-            # BUG FIX: apply I-TOX upgrade only when word is still "O"
-            # (if already B-TOX from a prior subword, keep B-TOX)
-            if word_bio[widx] == "O":
-                word_bio[widx] = "B-TOX"   # I-TOX without leading B-TOX → promote
-            # else: word already tagged B-TOX or I-TOX; no change needed
+        elif tag == "I-TOX" and word_bio[widx] == "O":
+            # Identik dengan predict_single_v2 NB05v2:
+            #   elif tag == 'I-TOX' and word_bio[widx] == 'O':
+            #       word_bio[widx] = 'I-TOX'
+            # PENTING: jangan promosi ke B-TOX — ini merusak span extraction
+            # multi-kata. Contoh: "anjing tua" → B-TOX I-TOX harus tetap
+            # satu span ['anjing tua'], bukan dua span ['anjing', 'tua'].
+            # CRF Viterbi dengan transisi valid (torchcrf) tidak akan
+            # menghasilkan I-TOX tanpa B-TOX sebelumnya dalam satu kalimat,
+            # tetapi pada level kata (word-level alignment), subword pertama
+            # sebuah kata yang melanjutkan span dapat ber-tag I-TOX — dan
+            # harus tetap I-TOX agar span extraction benar.
+            word_bio[widx] = "I-TOX"
+            # else: word already tagged B-TOX or I-TOX from a prior subword;
+            # no change needed — B-TOX takes priority over I-TOX.
 
-    # ── Step 6: Rekonstruksi I-TOX labels & spans ────────────────────────
-    # Post-process: any B-TOX word followed by more B-TOX within a run
-    # should have interior words downgraded to I-TOX for display accuracy.
-    # (The BIO logic above promotes all to B-TOX; this restores I-TOX.)
+    # ── Step 6: Span extraction — IDENTIK dengan predict_single_v2 NB05v2 ─
+    # Struktur loop tepat sama dengan kode NB05v2 agar span extraction
+    # konsisten secara akademis. I-TOX yang diikuti B-TOX sebelumnya
+    # (cur non-empty) akan digabung ke span yang sama.
     spans: list = []
     cur:   list = []
-    in_tox = False
-    for i, (w, bio) in enumerate(zip(words, word_bio)):
+    for w, bio in zip(words, word_bio):
         if bio == "B-TOX":
             if cur:
                 spans.append(" ".join(cur))
-            cur    = [w]
-            in_tox = True
-        elif bio == "I-TOX" and in_tox:
+            cur = [w]
+        elif bio == "I-TOX" and cur:
             cur.append(w)
         else:
             if cur:
                 spans.append(" ".join(cur))
-                cur    = []
-                in_tox = False
-            if bio not in ("B-TOX", "I-TOX"):
-                in_tox = False
+            cur = []
     if cur:
         spans.append(" ".join(cur))
 

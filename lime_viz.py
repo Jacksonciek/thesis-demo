@@ -11,6 +11,16 @@ Penting (dicatat di NB05v2 bagian Keterbatasan LIME):
 
 Jumlah sampel dikurangi dari 1000 (NB05) menjadi 200 (CPU-friendly).
 Chart menggunakan dark theme agar cocok dengan glassmorphism UI.
+
+BUGFIX vs versi sebelumnya:
+  - pred_label di chart title menggunakan threshold yang dikalibrasi (0.4429),
+    bukan argmax (threshold=0.5). NB05v2's explain_prediction_v4 menggunakan
+    argmax, tetapi predict_single_v2 dan collect_predictions menggunakan
+    threshold → demo lebih konsisten dengan threshold-based pipeline.
+    Ini adalah keputusan desain yang disengaja untuk akurasi live demo.
+  - Catatan: NB05v2 explain_prediction_v4 menggunakan argmax (implicit 0.5
+    threshold) untuk menentukan pred_label di printout — BERBEDA dari cara
+    evaluasi resmi. Demo ini LEBIH KONSISTEN secara akademis.
 """
 
 import re
@@ -67,9 +77,14 @@ def _make_predict_fn(tokenizer, model, device, max_length: int = 512):
     Fungsi ini:
       • Menerima list[str] (perturbed texts dari LIME)
       • Mengembalikan np.ndarray shape (N, 2) [P(NonHate), P(Hate)]
-    Alur identik dengan lime_predict_proba_v4() di NB05v2.
+
+    Alur identik dengan lime_predict_proba_v4() di NB05v2:
+      - Tokenisasi dengan max_length=512, padding='max_length', truncation=True
+      - Forward pass dengan torch.no_grad()
+      - Temperature scaling (identik dgn collect_predictions NB05v2)
+      - torch.softmax pada sentence_logits
     """
-    BATCH_SIZE = 8   # lebih kecil agar hemat RAM CPU
+    BATCH_SIZE = 8   # lebih kecil dari NB05v2 (16) agar hemat RAM CPU
 
     def predict_proba(texts: list) -> np.ndarray:
         model.eval()
@@ -90,12 +105,13 @@ def _make_predict_fn(tokenizer, model, device, max_length: int = 512):
             attention_mask = enc["attention_mask"].to(device)
             with torch.no_grad():
                 out = model(input_ids, attention_mask)
+            # Temperature scaling — identik dgn collect_predictions NB05v2
             temperature = float(getattr(model, "temperature", 1.0))
             probs = torch.softmax(
                 out["sentence_logits"].float() / temperature, dim=-1
             )
             all_probs.append(probs.cpu().numpy())
-        return np.vstack(all_probs)   # (N, 2)
+        return np.vstack(all_probs)   # (N, 2): col-0=P(Non-Hate), col-1=P(Hate)
 
     return predict_proba
 
@@ -108,10 +124,11 @@ def run_lime_explanation(
     tokenizer,
     model,
     device:       torch.device,
-    actual_label: int,          # 0=NonHate, 1=Hate  (dipakai sbg explain_label)
+    actual_label: int,          # 0=NonHate, 1=Hate (dipakai sbg explain_label)
     num_features: int  = 10,
     num_samples:  int  = 200,   # 200 untuk CPU (NB05 pakai 1000)
     max_length:   int  = 512,
+    threshold:    float = 0.4429,
 ) -> tuple:
     """
     Menjalankan LIME dan mengembalikan:
@@ -122,16 +139,21 @@ def run_lime_explanation(
     actual_label : int
         Label yang digunakan LIME untuk menjelaskan (0 atau 1).
         Di NB05v2: explain_label = actual_label saat label diketahui.
-        Di demo, kita pakai hasil prediksi model sebagai proxy.
+        Di demo live, kita pakai hasil prediksi model sebagai proxy
+        (actual_label diteruskan dari predict_text() di app_flask.py).
     num_samples  : int
         Jumlah perturbasi LIME. Lebih banyak = lebih akurat tapi lebih lambat.
         200 samples ≈ ~30–90 detik di CPU.
+    threshold    : float
+        Threshold dikalibrasi (default 0.4429 dari NB05v2 ROC curve).
+        BUGFIX: digunakan untuk pred_label (bukan argmax=0.5 seperti
+        explain_prediction_v4 asli di NB05v2) agar konsisten dengan pipeline.
 
     Returns
     -------
-    fig          : matplotlib.figure.Figure  (untuk gr.Plot)
+    fig          : matplotlib.figure.Figure
     contributions: list[tuple[str, float]]
-    pred_label   : str
+    pred_label   : str  ("HATE SPEECH" atau "NON-HATE")
     confidence   : float
     """
     text_norm = re.sub(r"\s+", " ", str(text)).strip()
@@ -140,14 +162,19 @@ def run_lime_explanation(
 
     predict_fn = _make_predict_fn(tokenizer, model, device, max_length)
 
-    # Validasi: ambil prediksi model untuk teks ini
+    # Prediksi model dengan threshold (konsisten dgn predict_text di inference.py)
+    # NB05v2 explain_prediction_v4 menggunakan argmax (implicit 0.5) → kurang
+    # konsisten. Demo ini menggunakan threshold yang dikalibrasi.
     probs      = predict_fn([text_norm])[0]   # [P(NH), P(H)]
-    pred_idx   = int(probs.argmax())
-    pred_label = "HATE SPEECH" if pred_idx == 1 else "NON-HATE"
-    confidence = float(probs[pred_idx])
+    prob_hate  = float(probs[1])
+    pred_label = "HATE SPEECH" if prob_hate >= threshold else "NON-HATE"
+    confidence = prob_hate if prob_hate >= threshold else float(probs[0])
 
-    # explain_label: ikuti actual_label jika tersedia, else pred
-    explain_label = actual_label
+    # explain_label: gunakan actual_label (= prediksi model dari app_flask.py)
+    # Identik dgn NB05v2: explain_label = actual_label if actual_label is not None else pred
+    # actual_label bisa bernilai 0 (NON-HATE) sehingga harus pakai 'is not None',
+    # bukan truthiness check (0 is falsy!).
+    explain_label = actual_label if actual_label is not None else int(prob_hate >= threshold)
 
     # ── Inisialisasi LIME (identik NB05v2) ─────────────────────────────
     explainer = LimeTextExplainer(
@@ -216,33 +243,9 @@ def _build_lime_chart(
 
     # ── Color logic ─────────────────────────────────────────────────────
     if explain_label == 1:
-        # Explaining HATE: positive = supports hate (red), negative = against (blue)
-        bar_colors = [
-            (_NEON_RED  if w > 0 else _NEON_BLUE)
-            for w in weights
-        ]
-        bar_alphas = [
-            min(1.0, 0.5 + abs(w) * 8)
-            for w in weights
-        ]
-        alpha_colors = [
-            f"{c}{int(a*255):02x}"
-            for c, a in zip(bar_colors, bar_alphas)
-        ]
+        bar_colors = [(_NEON_RED  if w > 0 else _NEON_BLUE) for w in weights]
     else:
-        # Explaining NON-HATE: positive = supports non-hate (green), negative = hate (red)
-        bar_colors = [
-            (_NEON_GREEN if w > 0 else _NEON_RED)
-            for w in weights
-        ]
-        bar_alphas = [
-            min(1.0, 0.5 + abs(w) * 8)
-            for w in weights
-        ]
-        alpha_colors = [
-            f"{c}{int(a*255):02x}"
-            for c, a in zip(bar_colors, bar_alphas)
-        ]
+        bar_colors = [(_NEON_GREEN if w > 0 else _NEON_RED) for w in weights]
 
     n     = len(words)
     fig_h = max(5, n * 0.5 + 3)
@@ -258,7 +261,7 @@ def _build_lime_chart(
         height    = 0.6,
     )
 
-    # Add glow effect via a second semi-transparent wider bar
+    # Glow effect via second semi-transparent wider bar
     for bar, bc in zip(bars, bar_colors):
         ax.barh(
             bar.get_y() + bar.get_height() / 2,
@@ -273,8 +276,10 @@ def _build_lime_chart(
     for bar, w in zip(bars, weights):
         x_off  = 0.0008 if w >= 0 else -0.0008
         ha     = "left" if w >= 0 else "right"
-        color  = _NEON_RED if w > 0 and explain_label == 1 else (
-                 _NEON_GREEN if w > 0 and explain_label == 0 else _NEON_BLUE)
+        if explain_label == 1:
+            color = _NEON_RED if w > 0 else _NEON_BLUE
+        else:
+            color = _NEON_GREEN if w > 0 else _NEON_RED
         ax.text(
             w + x_off,
             bar.get_y() + bar.get_height() / 2,
@@ -287,11 +292,7 @@ def _build_lime_chart(
 
     # Y-axis (word labels)
     ax.set_yticks(y_pos)
-    ax.set_yticklabels(
-        words, fontsize=10,
-        color=_TEXT_COLOR,
-        fontfamily="monospace",
-    )
+    ax.set_yticklabels(words, fontsize=10, color=_TEXT_COLOR, fontfamily="monospace")
 
     # Zero line
     ax.axvline(0, color=_GRID_COLOR, linewidth=1.2, alpha=0.8)
@@ -299,9 +300,7 @@ def _build_lime_chart(
     # X-axis label
     ax.set_xlabel(
         f"Kontribusi kata terhadap label '{label_name}'",
-        fontsize=10, color=_TEXT_DIM,
-        fontfamily="monospace",
-        labelpad=10,
+        fontsize=10, color=_TEXT_DIM, fontfamily="monospace", labelpad=10,
     )
 
     # Grid
@@ -349,11 +348,11 @@ def _build_lime_chart(
         0.5, -0.015,
         "⚠  LIME bersifat KUALITATIF: BPE tokenizer BLOOM ≠ word-level LIME. "
         "Gunakan sebagai indikasi, bukan kebenaran absolut.",
-        ha        = "center",
-        fontsize  = 7.5,
-        color     = "#3a5a7a",
-        style     = "italic",
-        transform = fig.transFigure,
+        ha         = "center",
+        fontsize   = 7.5,
+        color      = "#3a5a7a",
+        style      = "italic",
+        transform  = fig.transFigure,
         fontfamily = "monospace",
     )
 
@@ -362,10 +361,10 @@ def _build_lime_chart(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  Helper: figure → PIL Image (untuk gr.Image di Gradio)
+#  Helper: figure → PIL Image (untuk Flask response via base64)
 # ══════════════════════════════════════════════════════════════════════════
 def fig_to_pil(fig: plt.Figure) -> Image.Image:
-    """Mengkonversi matplotlib figure ke PIL Image untuk Gradio."""
+    """Mengkonversi matplotlib figure ke PIL Image."""
     buf = io.BytesIO()
     fig.savefig(
         buf, format="png",
