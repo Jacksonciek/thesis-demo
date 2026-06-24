@@ -17,7 +17,7 @@ from lime_viz  import run_lime_explanation, fig_to_pil
 from model_utils import load_model, load_tokenizer, load_threshold
 
 # ── Defaults ──────────────────────────────────────────────────────────────
-DEFAULT_CHECKPOINT     = os.path.join(_DEMO_DIR, "models", "main_bloom_mtl_v2", "best_model.pt")
+DEFAULT_CHECKPOINT     = os.path.join(_DEMO_DIR, "models", "main_bloom_mtl_v2", "best_model_hm.pt")
 DEFAULT_BLOOM_PATH     = os.path.join(_DEMO_DIR, "models", "bloom-560m-local")
 DEFAULT_THRESHOLD_JSON = os.path.join(_DEMO_DIR, "models", "threshold_info_v2.json")
 DEFAULT_LIME_SAMPLES   = 200

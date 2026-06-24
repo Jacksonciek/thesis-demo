@@ -127,7 +127,7 @@ def load_model(
     device: torch.device,
 ) -> BloomForMTL_v2:
     """
-    Memuat checkpoint main_bloom_mtl_v2/best_model.pt ke objek BloomForMTL_v2.
+    Memuat checkpoint main_bloom_mtl_v2/best_model_hm.pt ke objek BloomForMTL_v2.
 
     Alur identik dengan load_model() di NB05v2:
       1. torch.load checkpoint dict

@@ -56,7 +56,7 @@ def main():
     )
     parser.add_argument(
         "--checkpoint-id",
-        help="Google Drive File ID untuk best_model.pt "
+        help="Google Drive File ID untuk best_model_hm.pt "
              "(misal: 1AbCdEfGhIjKlMn...)",
     )
     parser.add_argument(
@@ -80,7 +80,7 @@ def main():
     print("="*60)
 
     if args.checkpoint_id:
-        out = os.path.join(CHECKPOINT_DIR, "best_model.pt")
+        out = os.path.join(CHECKPOINT_DIR, "best_model_hm.pt")
         if os.path.exists(out):
             print(f"  ℹ️  {out} sudah ada, skip.")
         else:
@@ -88,8 +88,8 @@ def main():
     else:
         print(
             "  ⚠️  --checkpoint-id tidak diberikan.\n"
-            "     Unduh best_model.pt secara manual dari Google Drive.\n"
-            f"     Simpan di: {CHECKPOINT_DIR}/best_model.pt"
+            "     Unduh best_model_hm.pt secara manual dari Google Drive.\n"
+            f"     Simpan di: {CHECKPOINT_DIR}/best_model_hm.pt"
         )
 
     if args.bloom_folder_id:
@@ -119,7 +119,7 @@ def main():
     print("\n" + "="*60)
     print(" Verifikasi file:")
     checks = [
-        (os.path.join(CHECKPOINT_DIR, "best_model.pt"), "best_model.pt (~4.2 GB)"),
+        (os.path.join(CHECKPOINT_DIR, "best_model_hm.pt"), "best_model_hm.pt (~4.2 GB)"),
         (os.path.join(BLOOM_DIR, "tokenizer.json"),     "bloom tokenizer.json"),
         (os.path.join(BLOOM_DIR, "config.json"),         "bloom config.json"),
     ]
