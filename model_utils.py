@@ -77,10 +77,24 @@ class BloomForMTL_v2(BloomPreTrainedModel):
     def _can_set_experts_implementation(cls) -> bool:
         return False
 
-    def forward(self, input_ids, attention_mask, **kwargs):
+    def forward(self, input_ids, attention_mask, compute_token_preds: bool = True, **kwargs):
         """
         Inference-only forward pass.
         Tidak menghitung loss (sentence_labels / token_labels diabaikan).
+
+        Parameters
+        ----------
+        compute_token_preds : bool, default True
+            Jika False, token head (Linear + CRF Viterbi decode) DILEWATI
+            sepenuhnya dan hanya sentence_logits yang dihitung.
+
+            PENTING (fix performa LIME): CRF.decode() dari torchcrf adalah
+            Python for-loop SEKUENSIAL sepanjang T (timestep), dijalankan
+            di CPU terlepas dari device model. Saat dipanggil ratusan kali
+            oleh LIME (num_samples=200) — yang HANYA butuh sentence_logits
+            untuk Non-Hate/Hate — biaya Viterbi decode ini murni terbuang.
+            Set False di context seperti itu; tetap True (default) untuk
+            predict_text() di inference.py yang memang butuh word_bio/spans.
         """
         out    = self.bloom(input_ids=input_ids, attention_mask=attention_mask)
         hidden = out.last_hidden_state                          # (B, T, H)
@@ -92,7 +106,14 @@ class BloomForMTL_v2(BloomPreTrainedModel):
         )
         sentence_logits = self.sentence_classifier(pooled)     # (B, 2)
 
-        # ── Token Head ───────────────────────────────────────────────────
+        # ── Token Head (opsional) ────────────────────────────────────────
+        if not compute_token_preds:
+            return {
+                "sentence_logits": sentence_logits,
+                "token_logits":    None,
+                "token_preds_crf": None,
+            }
+
         token_emissions = self.token_classifier(self.dropout(hidden))  # (B, T, 3)
 
         if self.use_crf:

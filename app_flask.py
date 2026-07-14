@@ -1,9 +1,11 @@
 import argparse
 import base64
+import hashlib
 import io
 import json
 import os
 import sys
+import time
 
 import torch
 from flask import Flask, jsonify, render_template_string, request
@@ -21,6 +23,40 @@ DEFAULT_CHECKPOINT     = os.path.join(_DEMO_DIR, "models", "main_bloom_mtl_v2", 
 DEFAULT_BLOOM_PATH     = os.path.join(_DEMO_DIR, "models", "bloom-560m-local")
 DEFAULT_THRESHOLD_JSON = os.path.join(_DEMO_DIR, "models", "threshold_info_v2.json")
 DEFAULT_LIME_SAMPLES   = 200
+DEFAULT_LIME_CACHE_DIR = os.path.join(_DEMO_DIR, "models", "lime_cache")
+
+DEMO_EXAMPLES = [
+    {
+        "id": "mixed-006",
+        "label": "NON-HATE",
+        "text": "gue ngerasa paling produktif tuh malam hari padahal jadwal mulai pagi, body clock gue rusak total",
+    },
+    {
+        "id": "mixed-008",
+        "label": "NON-HATE",
+        "text": "stadion tadi packed banget literally sesak, gue sampe kejepit tapi tetep worth it banget",
+    },
+    {
+        "id": "mixed-031",
+        "label": "NON-HATE",
+        "text": "gue lagi argue sama kakak gue soal hal kecil dan sekarang suasana di rumah jadi awkward, gue gak nyaman",
+    },
+    {
+        "id": "mixed-003",
+        "label": "HATE",
+        "text": "golongan kafir itu fr fr gak ada manfaatnya, smh why do we even bother with them",
+    },
+    {
+        "id": "mixed-010",
+        "label": "HATE",
+        "text": "orang sunda tuh sok ramah padahal dalamnya gak ikhlas, that fake friendliness is so tiring",
+    },
+    {
+        "id": "mixed-023",
+        "label": "HATE",
+        "text": "wanita yg karir duluin keluarga tuh egois, they make selfish choices and then complain about loneliness",
+    },
+]
 
 _STATE = {
     "model":     None,
@@ -28,6 +64,7 @@ _STATE = {
     "threshold": 0.4429,
     "device":    None,
     "ready":     False,
+    "lime_cache_dir": DEFAULT_LIME_CACHE_DIR,
 }
 
 app = Flask(__name__)
@@ -39,12 +76,112 @@ app = Flask(__name__)
 def _initialize(checkpoint, bloom_path, threshold_json):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _STATE["device"] = device
-    print(f"[App] Device: {device}")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        print(f"[App] Device: CUDA - {torch.cuda.get_device_name(0)}")
+    else:
+        print("[App] Device: CPU (CUDA tidak terdeteksi)")
     _STATE["tokenizer"] = load_tokenizer(bloom_path)
     _STATE["model"]     = load_model(checkpoint, bloom_path, device)
     _STATE["threshold"] = load_threshold(threshold_json)
     _STATE["ready"]     = True
     print("[App] ✅ Model siap.")
+
+
+def _normalise_cache_text(text: str) -> str:
+    return " ".join(str(text).strip().split()).lower()
+
+
+def _lime_cache_path(text: str, n_samples: int) -> str:
+    key_src = f"v2|{n_samples}|{_STATE['threshold']:.4f}|{_normalise_cache_text(text)}"
+    key = hashlib.sha256(key_src.encode("utf-8")).hexdigest()[:24]
+    return os.path.join(_STATE["lime_cache_dir"], f"{key}.json")
+
+
+def _load_lime_cache(text: str, n_samples: int):
+    path = _lime_cache_path(text, n_samples)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        payload["cache_hit"] = True
+        return payload
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _save_lime_cache(text: str, n_samples: int, payload: dict) -> None:
+    os.makedirs(_STATE["lime_cache_dir"], exist_ok=True)
+    path = _lime_cache_path(text, n_samples)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    os.replace(tmp_path, path)
+
+
+def _compute_lime_payload(text: str, n_samples: int) -> dict:
+    result = predict_text(
+        text      = text,
+        tokenizer = _STATE["tokenizer"],
+        model     = _STATE["model"],
+        device    = _STATE["device"],
+        threshold = _STATE["threshold"],
+    )
+    actual_label = 1 if result["pred"] == "HATE SPEECH" else 0
+
+    lime_started = time.perf_counter()
+    fig, contributions, pred_label, confidence = run_lime_explanation(
+        text         = text,
+        tokenizer    = _STATE["tokenizer"],
+        model        = _STATE["model"],
+        device       = _STATE["device"],
+        actual_label = actual_label,
+        num_features = 10,
+        num_samples  = n_samples,
+        threshold    = _STATE["threshold"],
+    )
+    if fig is None:
+        raise ValueError("LIME gagal — teks terlalu pendek?")
+    lime_time_seconds = time.perf_counter() - lime_started
+
+    pil_img = fig_to_pil(fig)
+    buf = io.BytesIO()
+    pil_img.save(buf, format="PNG")
+    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    top3 = sorted(contributions, key=lambda x: abs(x[1]), reverse=True)[:3]
+    contribution_rows = [
+        {"word": str(word), "weight": float(weight)}
+        for word, weight in sorted(contributions, key=lambda x: abs(x[1]), reverse=True)
+    ]
+
+    return {
+        "image_b64":   img_b64,
+        "input":       text,
+        "pred_label":  pred_label,
+        "confidence":  confidence,
+        "explain_label": actual_label,
+        "contributions": contribution_rows,
+        "top3":        top3,
+        "n_samples":   n_samples,
+        "lime_time_seconds": round(lime_time_seconds, 2),
+        "cache_hit":   False,
+    }
+
+
+def _warm_demo_lime_cache() -> None:
+    print(f"[LIME] Precomputing {len(DEMO_EXAMPLES)} mixed demo examples...")
+    for item in DEMO_EXAMPLES:
+        text = item["text"]
+        if _load_lime_cache(text, DEFAULT_LIME_SAMPLES):
+            print(f"[LIME] cache exists: {item['id']}")
+            continue
+        payload = _compute_lime_payload(text, DEFAULT_LIME_SAMPLES)
+        _save_lime_cache(text, DEFAULT_LIME_SAMPLES, payload)
+        print(f"[LIME] cached: {item['id']} ({payload['lime_time_seconds']}s)")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -61,6 +198,8 @@ def index():
         HTML_TEMPLATE,
         device_label=device_label,
         threshold=f"{_STATE['threshold']:.4f}",
+        demo_examples=json.dumps(DEMO_EXAMPLES, ensure_ascii=False),
+        lime_samples=DEFAULT_LIME_SAMPLES,
     )
 
 
@@ -104,48 +243,21 @@ def api_lime():
 
     body      = request.get_json(force=True)
     text      = (body.get("text") or "").strip()
-    # Cap diseragamkan dengan slider HTML (max="500") agar konsisten
-    n_samples = max(50, min(int(body.get("n_samples", DEFAULT_LIME_SAMPLES)), 500))
+    n_samples = DEFAULT_LIME_SAMPLES
 
     if not text:
         return jsonify({"error": "Teks kosong"}), 400
 
-    result = predict_text(
-        text      = text,
-        tokenizer = _STATE["tokenizer"],
-        model     = _STATE["model"],
-        device    = _STATE["device"],
-        threshold = _STATE["threshold"],
-    )
-    actual_label = 1 if result["pred"] == "HATE SPEECH" else 0
+    cached = _load_lime_cache(text, n_samples)
+    if cached:
+        return jsonify(cached)
 
-    fig, contributions, pred_label, confidence = run_lime_explanation(
-        text         = text,
-        tokenizer    = _STATE["tokenizer"],
-        model        = _STATE["model"],
-        device       = _STATE["device"],
-        actual_label = actual_label,
-        num_features = 10,
-        num_samples  = n_samples,
-        threshold    = _STATE["threshold"],  # BUG FIX: teruskan threshold 0.4429
-    )
-    if fig is None:
-        return jsonify({"error": "LIME gagal — teks terlalu pendek?"}), 400
-
-    pil_img = fig_to_pil(fig)
-    buf = io.BytesIO()
-    pil_img.save(buf, format="PNG")
-    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-    top3 = sorted(contributions, key=lambda x: abs(x[1]), reverse=True)[:3]
-
-    return jsonify({
-        "image_b64":   img_b64,
-        "pred_label":  pred_label,
-        "confidence":  confidence,
-        "top3":        top3,
-        "n_samples":   n_samples,
-    })
+    try:
+        payload = _compute_lime_payload(text, n_samples)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    _save_lime_cache(text, n_samples, payload)
+    return jsonify(payload)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -434,6 +546,20 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
 input[type=range]::-webkit-slider-thumb:hover{transform:scale(1.3)}
 .s-val{font-family:var(--fm);font-size:10px;color:var(--v2);min-width:30px;text-align:right}
 .lime-cav{font-family:var(--fm);font-size:9px;color:rgba(245,158,11,.45);background:rgba(245,158,11,.04);border:1px solid rgba(245,158,11,.1);border-radius:8px;padding:7px 12px;line-height:1.65}
+.fixed-pill{font-family:var(--fm);font-size:9px;letter-spacing:1.8px;text-transform:uppercase;color:var(--c2);background:rgba(6,182,212,.07);border:1px solid rgba(6,182,212,.18);border-radius:999px;padding:8px 12px;white-space:nowrap}
+.demo-sect{display:flex;flex-direction:column;gap:10px;transition:opacity .35s,max-height .45s;max-height:340px;overflow:hidden}
+.demo-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.demo-chip{min-height:58px;text-align:left;border:1px solid var(--border);border-radius:10px;background:rgba(8,14,36,.62);color:var(--t2);padding:9px 10px;cursor:pointer;transition:border-color .18s,background .18s,transform .18s,box-shadow .18s}
+.demo-chip:hover{transform:translateY(-1px);border-color:rgba(103,232,249,.28);background:rgba(14,22,46,.82);box-shadow:0 10px 28px rgba(6,182,212,.08)}
+.demo-chip.active{border-color:rgba(167,139,250,.45);background:rgba(124,58,237,.13)}
+.demo-top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}
+.demo-tag{font-family:var(--fm);font-size:8px;letter-spacing:1.2px;text-transform:uppercase;color:var(--t4)}
+.demo-tag.hate{color:#fda4af}.demo-tag.safe{color:#6ee7b7}
+.demo-cache{font-family:var(--fm);font-size:7px;letter-spacing:1px;color:var(--c2);border:1px solid rgba(6,182,212,.18);border-radius:999px;padding:2px 6px;background:rgba(6,182,212,.06)}
+.demo-text{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:11px;line-height:1.45;color:var(--t2)}
+#app.split .demo-sect{max-height:260px;overflow-y:auto;padding-right:2px}
+#app.split .demo-list{grid-template-columns:1fr}
+@media (max-width:640px){.demo-list{grid-template-columns:1fr}}
 
 /* Hide LIME in center mode */
 .lime-sect{
@@ -520,6 +646,42 @@ input[type=range]::-webkit-slider-thumb:hover{transform:scale(1.3)}
 .loading-inner span{font-family:var(--fm);font-size:10px;letter-spacing:2px}
 .lime-sum{font-family:var(--fm);font-size:10px;line-height:1.9;color:var(--t3);background:rgba(10,16,40,.7);border:1px solid var(--border);border-radius:var(--r);padding:14px 16px;margin-top:10px;white-space:pre-line;display:none}
 .lime-sum.show{display:block;animation:paneIn .3s ease}
+.lime-run{width:100%;max-width:420px;padding:24px}
+.lime-run-title{font-family:var(--fm);font-size:10px;letter-spacing:2.6px;text-transform:uppercase;color:var(--v2);margin-bottom:12px;text-align:center}
+.lime-run-track{height:4px;background:rgba(255,255,255,.07);border-radius:2px;overflow:hidden}
+.lime-run-fill{height:100%;width:0;background:linear-gradient(90deg,#5b8dee,var(--v2),var(--c2));border-radius:2px;box-shadow:0 0 18px rgba(91,141,238,.35);transition:width .12s linear}
+.lime-run-meta{display:flex;justify-content:space-between;gap:12px;margin-top:10px;font-family:var(--fm);font-size:9px;color:var(--t4);text-transform:uppercase;letter-spacing:1.2px}
+.lime-card{background:rgba(14,20,34,.82);border:1px solid var(--border);border-radius:var(--r2);padding:22px 24px;animation:paneIn .35s ease both}
+.lime-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:16px}
+.lime-title{font-family:var(--fh);font-size:15px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--t1)}
+.lime-meta{font-family:var(--fm);font-size:10px;color:var(--t4);text-align:right;line-height:1.7}
+.sentence-highlight{background:rgba(9,13,24,.92);border:1px solid var(--border);border-radius:10px;padding:13px 15px;margin-bottom:17px;color:var(--t2);line-height:1.9}
+.lime-token{display:inline-block;margin:2px 1px;padding:0 5px;border-radius:4px;border:1px solid transparent;cursor:help}
+.lime-token.hate-token{background:rgba(239,68,68,.16);border-color:rgba(239,68,68,.28);color:#fecaca}
+.lime-token.safe-token{background:rgba(34,211,160,.14);border-color:rgba(34,211,160,.26);color:#bbf7d0}
+.lime-chart{display:flex;flex-direction:column;gap:8px;margin-bottom:17px}
+.lime-row{display:grid;grid-template-columns:minmax(90px,128px) 1fr 76px;align-items:center;gap:10px}
+.lime-word{min-width:0;display:flex;justify-content:flex-end;align-items:center;gap:6px;font-family:var(--fm);font-size:11px;color:var(--t1);text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rank-pill{flex:0 0 auto;font-size:8px;padding:2px 5px;border-radius:4px;background:rgba(255,255,255,.04);border:1px solid var(--border);color:var(--t4)}
+.rank-pill.hate-p{color:#fca5a5;border-color:rgba(239,68,68,.24)}
+.rank-pill.safe-p{color:#86efac;border-color:rgba(34,211,160,.22)}
+.lime-axis-wrap{height:22px;position:relative;display:flex;align-items:center;background:rgba(5,8,15,.38);border-radius:4px;overflow:hidden}
+.lime-center{position:absolute;left:50%;top:0;bottom:0;width:1px;background:var(--border2)}
+.lime-bar{height:14px;max-width:48%;border-radius:3px;position:absolute;transition:width .6s cubic-bezier(.4,0,.2,1)}
+.lime-bar.hate-bar{left:50%;background:linear-gradient(90deg,rgba(239,68,68,.75),rgba(249,115,22,.8))}
+.lime-bar.safe-bar{right:50%;background:linear-gradient(270deg,rgba(34,211,160,.78),rgba(6,182,212,.78))}
+.lime-wt{font-family:var(--fm);font-size:10px;text-align:right}
+.lime-wt.hate-w{color:#f87171}.lime-wt.safe-w{color:#34d399}
+.lime-legend{display:flex;gap:16px;flex-wrap:wrap;padding-top:13px;border-top:1px solid var(--border);font-family:var(--fm);font-size:9px;color:var(--t4)}
+.legend-item{display:flex;align-items:center;gap:7px}
+.legend-dot{width:8px;height:8px;border-radius:50%}
+.legend-dot.hate{background:var(--h);box-shadow:0 0 10px rgba(239,68,68,.35)}
+.legend-dot.safe{background:var(--g);box-shadow:0 0 10px rgba(34,211,160,.35)}
+.lime-footer{margin-top:12px;padding-top:12px;border-top:1px solid var(--border);display:flex;gap:18px;flex-wrap:wrap}
+.lime-stat{display:flex;flex-direction:column;gap:2px}
+.lime-stat-lbl{font-family:var(--fm);font-size:8px;text-transform:uppercase;letter-spacing:1.3px;color:var(--t4)}
+.lime-stat-val{font-family:var(--fm);font-size:11px;color:var(--t2)}
+@media (max-width:640px){.lime-card{padding:18px}.lime-head{flex-direction:column}.lime-meta{text-align:left}.lime-row{grid-template-columns:82px 1fr 58px}.lime-word{font-size:10px}.lime-wt{font-size:9px}}
 @keyframes paneIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
 
 /* Results enter animation */
@@ -650,20 +812,11 @@ input[type=range]::-webkit-slider-thumb:hover{transform:scale(1.3)}
           ANALYZE
         </button>
         <button class="btn-s" onclick="clearAll()">CLEAR</button>
+        <button class="btn-s" id="btnLime" onclick="runLime()">
+          <svg width="13" height="13" fill="none" viewBox="0 0 12 12" style="position:relative;z-index:1"><circle cx="6" cy="4.6" r="3" stroke="currentColor" stroke-width="1.1"/><path d="M4.7 9.3h2.6M5.2 10.4h1.6" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/></svg>
+          LIME
+        </button>
         <span class="char-ct" id="charCt">0 / 512</span>
-      </div>
-
-      <!-- LIME (hidden in center, revealed after split) -->
-      <div class="lime-sect">
-        <div class="panel-lbl"><div class="panel-lbl-dot" style="background:var(--c);box-shadow:0 0 6px var(--c)"></div>LIME INTERPRETABILITY</div>
-        <div class="lime-ctrl">
-          <span class="s-lbl">SAMPLES</span>
-          <input type="range" id="limeSlider" min="50" max="500" value="200" step="50"
-            oninput="this.style.setProperty('--p',((this.value-50)/450*100)+'%');document.getElementById('limeVal').textContent=this.value">
-          <span class="s-val" id="limeVal">200</span>
-          <button class="btn-s" id="btnLime" onclick="runLime()">RUN LIME</button>
-        </div>
-        <div class="lime-cav">⚠ LIME beroperasi di level kata — BPE tokenizer BLOOM menyebabkan mismatch subword. Gunakan sebagai indikasi kualitatif.</div>
       </div>
 
       <!-- Status bar -->
@@ -852,6 +1005,8 @@ document.getElementById('spBtn').addEventListener('click',()=>triggerEntry(),{on
 
 /* APP LOGIC */
 const $ta=document.getElementById('inputText');
+const DEMO_EXAMPLES={{ demo_examples|safe }};
+const FIXED_LIME_SAMPLES={{ lime_samples }};
 $ta.addEventListener('input',()=>{
   document.getElementById('charCt').textContent=$ta.value.length+' / 512';
 });
@@ -865,9 +1020,37 @@ function clearAll(){
   $ta.value='';
   document.getElementById('charCt').textContent='0 / 512';
   setStatus('STANDBY — masukkan teks lalu tekan Enter','s-idle');
+  document.querySelectorAll('.demo-chip.active').forEach(el=>el.classList.remove('active'));
   /* Collapse back to center if desired */
   /* Uncomment next line to reset to center on clear: */
   /* document.getElementById('app').classList.remove('split'); */
+}
+
+function renderDemoExamples(){
+  const list=document.getElementById('demoList');
+  if(!list)return;
+  list.innerHTML=DEMO_EXAMPLES.map((item,idx)=>{
+    const safe=item.label==='NON-HATE';
+    return `<button class="demo-chip" type="button" data-demo-idx="${idx}" onclick="runDemoExample(${idx})">
+      <div class="demo-top">
+        <span class="demo-tag ${safe?'safe':'hate'}">${escHtml(item.label)}</span>
+        <span class="demo-cache">LIME CACHE</span>
+      </div>
+      <div class="demo-text">${escHtml(item.text)}</div>
+    </button>`;
+  }).join('');
+}
+
+async function runDemoExample(idx){
+  const item=DEMO_EXAMPLES[idx];
+  if(!item)return;
+  document.querySelectorAll('.demo-chip.active').forEach(el=>el.classList.remove('active'));
+  const chip=document.querySelector(`[data-demo-idx="${idx}"]`);
+  if(chip)chip.classList.add('active');
+  $ta.value=item.text;
+  document.getElementById('charCt').textContent=$ta.value.length+' / 512';
+  setStatus('Menjalankan contoh dataset mixed + LIME cache...','s-load');
+  await runAnalyze({autoLime:true});
 }
 
 /* Escape HTML untuk mencegah XSS pada token yang dirender di BIO table */
@@ -877,6 +1060,103 @@ function escHtml(s){
     .replace(/</g,'&lt;')
     .replace(/>/g,'&gt;')
     .replace(/"/g,'&quot;');
+}
+
+function normalizeLimeKey(s){
+  return String(s).toLowerCase().replace(/[^a-z0-9_]+/g,'').trim();
+}
+
+function limePushesHate(weight, explainLabel){
+  return Number(explainLabel)===1 ? weight>0 : weight<0;
+}
+
+let limeProgressRaf=null;
+function startLimeProgress(nSamples){
+  if(limeProgressRaf) cancelAnimationFrame(limeProgressRaf);
+  document.getElementById('limeSection').innerHTML=
+    `<div class="lime-vis">
+      <div class="lime-run">
+        <div class="lime-run-title">LIME EXPLAINABILITY RUNNING</div>
+        <div class="lime-run-track"><div class="lime-run-fill" id="limeRunFill"></div></div>
+        <div class="lime-run-meta"><span id="limeRunPct">0%</span><span>LIME</span></div>
+      </div>
+    </div>`;
+  const fill=document.getElementById('limeRunFill');
+  const pct=document.getElementById('limeRunPct');
+  const started=performance.now();
+  const duration=Math.max(12000,nSamples*120);
+  function tick(now){
+    const p=Math.min(((now-started)/duration)*95,95);
+    fill.style.width=p.toFixed(1)+'%';
+    pct.textContent=Math.floor(p)+'%';
+    if(p<95) limeProgressRaf=requestAnimationFrame(tick);
+  }
+  limeProgressRaf=requestAnimationFrame(tick);
+}
+
+function finishLimeProgress(){
+  if(limeProgressRaf) cancelAnimationFrame(limeProgressRaf);
+  limeProgressRaf=null;
+  const fill=document.getElementById('limeRunFill');
+  const pct=document.getElementById('limeRunPct');
+  if(fill) fill.style.width='100%';
+  if(pct) pct.textContent='100%';
+}
+
+function renderLimeCard(d){
+  const contributions=(d.contributions||[]).map(item=>({
+    word:String(item.word||''),
+    weight:Number(item.weight||0)
+  }));
+  const maxW=Math.max(0.0001,...contributions.map(item=>Math.abs(item.weight)));
+  const wordWeights={};
+  contributions.forEach(item=>{
+    const key=normalizeLimeKey(item.word);
+    if(key) wordWeights[key]=item.weight;
+  });
+
+  const highlighted=String(d.input||$ta.value).split(/(\s+)/).map(part=>{
+    if(/^\s+$/.test(part)) return part;
+    const key=normalizeLimeKey(part);
+    const weight=wordWeights[key];
+    if(weight===undefined || Math.abs(weight)<0.0001) return escHtml(part);
+    const isHate=limePushesHate(weight,d.explain_label);
+    const title=(isHate?'Pushes toward hate: ':'Pushes toward non-hate: ')+(weight>0?'+':'')+weight.toFixed(4);
+    return `<span class="lime-token ${isHate?'hate-token':'safe-token'}" title="${escHtml(title)}">${escHtml(part)}</span>`;
+  }).join('');
+
+  const rows=contributions.map((item,idx)=>{
+    const isHate=limePushesHate(item.weight,d.explain_label);
+    const pct=Math.max(3,(Math.abs(item.weight)/maxW)*48);
+    const signed=(item.weight>0?'+':'')+item.weight.toFixed(4);
+    return `<div class="lime-row">
+      <div class="lime-word"><span class="rank-pill ${isHate?'hate-p':'safe-p'}">#${idx+1}</span><span>${escHtml(item.word)}</span></div>
+      <div class="lime-axis-wrap">
+        <div class="lime-center"></div>
+        <div class="lime-bar ${isHate?'hate-bar':'safe-bar'}" style="width:${pct}%"></div>
+      </div>
+      <div class="lime-wt ${isHate?'hate-w':'safe-w'}">${signed}</div>
+    </div>`;
+  }).join('') || `<div class="lime-vis" style="min-height:120px;color:var(--t4);font-family:var(--fm);font-size:10px">Tidak ada kontribusi LIME tersedia.</div>`;
+
+  document.getElementById('limeSection').innerHTML=
+    `<div class="lime-card">
+      <div class="lime-head">
+        <div class="lime-title">LIME Word Contributions</div>
+        <div class="lime-meta">${contributions.length} features<br>${d.cache_hit?'cached':((d.lime_time_seconds||'-')+'s')}</div>
+      </div>
+      <div class="sentence-highlight">${highlighted}</div>
+      <div class="lime-chart">${rows}</div>
+      <div class="lime-legend">
+        <div class="legend-item"><div class="legend-dot hate"></div>Pushes toward Hate Speech</div>
+        <div class="legend-item"><div class="legend-dot safe"></div>Pushes toward Non-Hate</div>
+      </div>
+      <div class="lime-footer">
+        <div class="lime-stat"><div class="lime-stat-lbl">Model</div><div class="lime-stat-val">${escHtml(d.pred_label)}</div></div>
+        <div class="lime-stat"><div class="lime-stat-lbl">Confidence</div><div class="lime-stat-val">${(Number(d.confidence||0)*100).toFixed(1)}%</div></div>
+        <div class="lime-stat"><div class="lime-stat-lbl">Perturbations</div><div class="lime-stat-val">${d.n_samples} samples</div></div>
+      </div>
+    </div>`;
 }
 
 function renderResult(d){
@@ -988,6 +1268,8 @@ function renderResult(d){
   if(d.bio_rows&&d.bio_rows.length) console.debug('[BIO] sample tag format:', d.bio_rows[0]);
 }
 
+renderDemoExamples();
+
 function showRpOverlay(){
   let ov=document.getElementById('rpOverlay');
   if(!ov){
@@ -1009,7 +1291,7 @@ function hideRpOverlay(){
   setTimeout(()=>{ov.style.display='none';},280);
 }
 
-async function runAnalyze(){
+async function runAnalyze(opts={}){
   const text=$ta.value.trim();
   if(!text){setStatus('Teks kosong.','s-err');return;}
 
@@ -1039,6 +1321,9 @@ async function runAnalyze(){
     if(!res.ok){hideRpOverlay();setStatus(d.error||'Error','s-err');return;}
     renderResult(d);
     setStatus(d.pred+' · P(hate)='+d.prob_hate.toFixed(4),'s-ok');
+    if(opts.autoLime){
+      await runLime({auto:true});
+    }
   }catch(e){
     hideRpOverlay();
     setStatus('Error: '+e.message,'s-err');
@@ -1046,29 +1331,31 @@ async function runAnalyze(){
   finally{document.getElementById('btnAnalyze').disabled=false;}
 }
 
-async function runLime(){
+async function runLime(opts={}){
   const text=$ta.value.trim();
   if(!text){setStatus('Teks kosong.','s-err');return;}
-  const nSamples=parseInt(document.getElementById('limeSlider').value)||200;
+  const nSamples=FIXED_LIME_SAMPLES;
   setStatus('LIME sedang berjalan — harap tunggu...','s-load');
   document.getElementById('btnLime').disabled=true;
-  document.getElementById('limeSection').innerHTML=
-    `<div class="lime-vis"><div class="loading-inner"><div class="spinner"></div><span>COMPUTING ${nSamples} PERTURBATIONS...</span></div></div>`;
+  startLimeProgress(nSamples);
   document.getElementById('limeSection').scrollIntoView({behavior:'smooth',block:'start'});
   try{
     const res=await fetch('/api/lime',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,n_samples:nSamples})});
     const d=await res.json();
     if(!res.ok){
+      finishLimeProgress();
       setStatus(d.error||'LIME error','s-err');
       document.getElementById('limeSection').innerHTML=`<div class="lime-vis" style="padding:20px;color:var(--h);font-family:var(--fm);font-size:11px;">${d.error||'LIME gagal'}</div>`;
       return;
     }
-    const top3txt=d.top3.map(([w,v])=>`  ${w.padEnd(18)} ${v>0?'+':''}${v.toFixed(4)}`).join('\n');
-    document.getElementById('limeSection').innerHTML=
-      `<div class="lime-vis"><img src="data:image/png;base64,${d.image_b64}" alt="LIME chart"/></div>
-       <div class="lime-sum show">MODEL: ${d.pred_label}  |  CONF: ${(d.confidence*100).toFixed(1)}%  |  SAMPLES: ${d.n_samples}\n\nTop kontribusi kata:\n${top3txt}</div>`;
-    setStatus('LIME selesai · '+d.pred_label,'s-ok');
-  }catch(e){setStatus('LIME error: '+e.message,'s-err');}
+    finishLimeProgress();
+    setTimeout(()=>renderLimeCard(d),180);
+    setStatus((d.cache_hit?'LIME cache · ':'LIME selesai · ')+d.pred_label,'s-ok');
+  }catch(e){
+    finishLimeProgress();
+    setStatus('LIME error: '+e.message,'s-err');
+    document.getElementById('limeSection').innerHTML=`<div class="lime-vis" style="padding:20px;color:var(--h);font-family:var(--fm);font-size:11px;">${escHtml(e.message)}</div>`;
+  }
   finally{document.getElementById('btnLime').disabled=false;}
 }
 
@@ -1093,11 +1380,14 @@ def main():
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
     parser.add_argument("--bloom",      default=DEFAULT_BLOOM_PATH)
     parser.add_argument("--threshold",  default=DEFAULT_THRESHOLD_JSON)
-    parser.add_argument("--lime-samples", type=int, default=DEFAULT_LIME_SAMPLES)
+    parser.add_argument("--lime-cache-dir", default=DEFAULT_LIME_CACHE_DIR)
+    parser.add_argument("--precompute-demo-lime", action="store_true",
+                        help="Hitung dan simpan cache LIME untuk semua bubble contoh sebelum server dibuka.")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
+    _STATE["lime_cache_dir"] = args.lime_cache_dir
 
     missing = []
     if not os.path.exists(args.checkpoint):
@@ -1118,6 +1408,8 @@ def main():
     print(" Hate Speech Demo — BLOOM-560m MTL")
     print("="*60)
     _initialize(args.checkpoint, args.bloom, args.threshold)
+    if args.precompute_demo_lime:
+        _warm_demo_lime_cache()
     print(f"[App] Buka browser di http://localhost:{args.port}")
     print("="*60)
 

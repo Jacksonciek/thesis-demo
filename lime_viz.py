@@ -84,7 +84,10 @@ def _make_predict_fn(tokenizer, model, device, max_length: int = 512):
       - Temperature scaling (identik dgn collect_predictions NB05v2)
       - torch.softmax pada sentence_logits
     """
-    BATCH_SIZE = 8   # lebih kecil dari NB05v2 (16) agar hemat RAM CPU
+    # BATCH_SIZE dinaikkan dari 8 → 32. LIME memanggil predict_fn utk 200
+    # perturbasi; batch lebih besar = lebih sedikit overhead per-batch
+    # (baik di CPU maupun GPU). Turunkan lagi ke 8-16 hanya jika OOM.
+    BATCH_SIZE = 32 if device.type == "cuda" else 16
 
     def predict_proba(texts: list) -> np.ndarray:
         model.eval()
@@ -96,7 +99,17 @@ def _make_predict_fn(tokenizer, model, device, max_length: int = 512):
             ]
             enc = tokenizer(
                 batch_texts,
-                padding        = "max_length",
+                # FIX PERFORMA: padding="max_length" memaksa SETIAP batch
+                # (200 perturbasi LIME) di-pad sampai 512 token, walau teks
+                # aslinya cuma ~10-30 kata. Ini membuat attention BLOOM
+                # (biaya ~O(T^2)) dan CRF Viterbi decode (loop Python
+                # sekuensial ~O(T)) berjalan di panjang 512 utk SETIAP
+                # sample, bukan panjang aktualnya. padding="longest" hanya
+                # mem-pad selebar sample terpanjang DI DALAM batch tsb —
+                # inilah yang membuat app.py teman kamu jauh lebih cepat
+                # (dia pakai padding=True + max_length=128).
+                # max_length tetap dipertahankan sbg batas TRUNCATION saja.
+                padding        = "longest",
                 truncation     = True,
                 max_length     = max_length,
                 return_tensors = "pt",
@@ -104,7 +117,12 @@ def _make_predict_fn(tokenizer, model, device, max_length: int = 512):
             input_ids      = enc["input_ids"].to(device)
             attention_mask = enc["attention_mask"].to(device)
             with torch.no_grad():
-                out = model(input_ids, attention_mask)
+                # compute_token_preds=False: lewati token head + CRF
+                # Viterbi decode sepenuhnya. LIME cuma butuh sentence_logits
+                # (Hate/Non-Hate), sehingga menjalankan CRF decode di sini
+                # adalah kerja terbuang — dan CRF decode adalah bagian
+                # PALING mahal karena bersifat sekuensial per-timestep.
+                out = model(input_ids, attention_mask, compute_token_preds=False)
             # Temperature scaling — identik dgn collect_predictions NB05v2
             temperature = float(getattr(model, "temperature", 1.0))
             probs = torch.softmax(
@@ -187,7 +205,12 @@ def run_lime_explanation(
         predict_fn,
         num_features = num_features,
         num_samples  = num_samples,
-        labels       = [0, 1],
+        # Hanya fit surrogate linear model utk label yang benar-benar dipakai
+        # (exp.as_list(label=explain_label) di bawah). Ini TIDAK mengurangi
+        # jumlah pemanggilan predict_fn (itu sudah ditentukan oleh
+        # num_samples), tapi menghindari 1 fit Ridge regression tambahan
+        # yang tak terpakai — kecil, tapi gratis.
+        labels       = [explain_label],
     )
 
     contributions = exp.as_list(label=explain_label)
